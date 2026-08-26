@@ -1,0 +1,375 @@
+nextflow.enable.dsl=2
+
+/*
+=========================================
+  Params Definition
+=========================================
+*/
+
+params.data_dir       = "${projectDir}/raw_data"
+params.outdir         = "${projectDir}/results"
+params.min_genes      = 200
+params.max_genes      = 6000
+params.max_mt         = 20
+
+params.resolution     = 0.6
+params.dims           = 20
+params.cell_selection = ""
+
+// Human data
+params.mt_pattern     = "^MT-"
+params.ribo_pattern   = "^RPS|^RPL"
+
+
+/*
+=========================================
+  Processes Definition
+=========================================
+*/
+
+process CREATE_AND_QC {
+    publishDir "${params.outdir}/01_QC", mode: 'copy'
+
+    input:
+    tuple val(sample_id), path(h5_file)
+
+    output:
+    path("*_qc.rds"), emit: rds
+    path("*_QC_plots.png"), emit: qc_plot
+
+    script:
+    """
+    #!/usr/bin/env Rscript
+
+    library(Seurat)
+    library(ggplot2)
+
+    counts <- Read10X_h5("${h5_file}")
+
+    if (is.list(counts) && "Gene Expression" %in% names(counts)) {
+        counts <- counts[["Gene Expression"]]
+    }
+
+    obj <- CreateSeuratObject(
+        counts = counts,
+        project = "${sample_id}"
+    )
+
+    obj\$tissue <- "${sample_id}"
+
+    obj[["percent.mt"]] <- PercentageFeatureSet(
+        obj,
+        pattern = "${params.mt_pattern}"
+    )
+
+    obj[["percent.ribo"]] <- PercentageFeatureSet(
+        obj,
+        pattern = "${params.ribo_pattern}"
+    )
+
+    p_qc <- VlnPlot(
+        obj,
+        features = c("nFeature_RNA", "nCount_RNA", "percent.mt", "percent.ribo"),
+        ncol = 4,
+        pt.size = 0.1
+    )
+
+    ggsave(
+        "${sample_id}_QC_plots.png",
+        plot = p_qc,
+        width = 12,
+        height = 5,
+        dpi = 300,
+        bg = "white"
+    )
+
+    cell_sel <- "${params.cell_selection}"
+
+    if (nchar(cell_sel) > 0) {
+        obj <- NormalizeData(obj, verbose = FALSE)
+    }
+
+    filter_expr <- "nFeature_RNA >= ${params.min_genes} & nFeature_RNA <= ${params.max_genes} & percent.mt <= ${params.max_mt}"
+
+    if (nchar(cell_sel) > 0) {
+        filter_expr <- paste0(filter_expr, " & (", cell_sel, ")")
+    }
+
+    obj_qc <- eval(
+        parse(
+            text = paste0("subset(obj, subset = ", filter_expr, ")")
+        )
+    )
+
+    if (ncol(obj_qc) == 0) {
+        stop("No cells left after QC/filtering for sample: ${sample_id}")
+    }
+
+    saveRDS(
+        obj_qc,
+        file = "${sample_id}_qc.rds"
+    )
+    """
+}
+
+
+process MERGE_SAMPLES {
+    publishDir "${params.outdir}/02_Merged", mode: 'copy'
+
+    input:
+    path rds_files
+
+    output:
+    path("merged_qc_samples.rds"), emit: rds
+
+    script:
+    """
+    #!/usr/bin/env Rscript
+
+    library(Seurat)
+
+    files <- sort(list.files(pattern = "_qc[.]rds"))
+
+    if (length(files) == 0) {
+        stop("No QC RDS files found")
+    }
+
+    obj_list <- lapply(files, readRDS)
+    sample_ids <- sub("_qc[.]rds", "", basename(files))
+
+    if (length(obj_list) > 1) {
+        merged_obj <- merge(
+            x = obj_list[[1]],
+            y = obj_list[-1],
+            add.cell.ids = sample_ids
+        )
+
+        if (exists("JoinLayers")) {
+            merged_obj <- JoinLayers(merged_obj)
+        }
+
+    } else {
+        merged_obj <- obj_list[[1]]
+    }
+
+    saveRDS(
+        merged_obj,
+        file = "merged_qc_samples.rds"
+    )
+    """
+}
+
+
+process NORM_PCA {
+    publishDir "${params.outdir}/03_Norm_PCA", mode: 'copy'
+
+    input:
+    path merged_rds
+
+    output:
+    path("seurat_normalized_pca.rds"), emit: rds
+    path("ElbowPlot.png"), emit: elbow
+
+    script:
+    """
+    #!/usr/bin/env Rscript
+
+    library(Seurat)
+    library(ggplot2)
+
+    seurat_obj <- readRDS("${merged_rds}")
+
+    DefaultAssay(seurat_obj) <- "RNA"
+
+    seurat_obj <- NormalizeData(
+        seurat_obj,
+        normalization.method = "LogNormalize",
+        scale.factor = 10000
+    )
+
+    seurat_obj <- FindVariableFeatures(
+        seurat_obj,
+        selection.method = "vst",
+        nfeatures = 2000
+    )
+
+    seurat_obj <- ScaleData(seurat_obj)
+
+    seurat_obj <- RunPCA(
+        seurat_obj,
+        npcs = 30,
+        verbose = FALSE
+    )
+
+    p_elbow <- ElbowPlot(seurat_obj, ndims = 30) +
+        theme_classic(base_size = 14)
+
+    ggsave(
+        "ElbowPlot.png",
+        plot = p_elbow,
+        width = 7,
+        height = 5,
+        dpi = 300,
+        bg = "white"
+    )
+
+    saveRDS(
+        seurat_obj,
+        file = "seurat_normalized_pca.rds"
+    )
+    """
+}
+
+
+process CLUSTERING_UMAP {
+    publishDir "${params.outdir}/04_Clustering", mode: 'copy'
+
+    input:
+    path pca_rds
+
+    output:
+    path("Tcell_QC_clustered_UMAP.rds"), emit: rds
+    path("*.png"), emit: plots
+    path("*.csv"), emit: tables
+
+    script:
+    """
+    #!/usr/bin/env Rscript
+
+    library(Seurat)
+    library(ggplot2)
+    library(dplyr)
+
+    tcell_obj <- readRDS("${pca_rds}")
+
+    DefaultAssay(tcell_obj) <- "RNA"
+
+    dims_use <- 1:${params.dims}
+
+    tcell_obj <- FindNeighbors(
+        tcell_obj,
+        dims = dims_use
+    )
+
+    tcell_obj <- FindClusters(
+        tcell_obj,
+        resolution = ${params.resolution}
+    )
+
+    tcell_obj <- RunUMAP(
+        tcell_obj,
+        dims = dims_use
+    )
+
+    saveRDS(
+        tcell_obj,
+        "Tcell_QC_clustered_UMAP.rds"
+    )
+
+    p_umap_all <- DimPlot(
+        tcell_obj,
+        reduction = "umap",
+        group.by = "seurat_clusters",
+        label = TRUE,
+        repel = TRUE,
+        pt.size = 0.25
+    ) +
+        theme_classic(base_size = 14) +
+        ggtitle("Clusters after QC")
+
+    ggsave(
+        "Tcell_QC_UMAP_All_Clusters.png",
+        plot = p_umap_all,
+        width = 8,
+        height = 6,
+        dpi = 300,
+        bg = "white"
+    )
+
+    split_var <- if ("tissue" %in% colnames(tcell_obj@meta.data)) {
+        "tissue"
+    } else {
+        "orig.ident"
+    }
+
+    p_umap_split <- DimPlot(
+        tcell_obj,
+        reduction = "umap",
+        split.by = split_var,
+        label = TRUE,
+        repel = TRUE,
+        pt.size = 0.25
+    ) +
+        theme_classic(base_size = 14) +
+        ggtitle("UMAP split by sample/tissue")
+
+    ggsave(
+        "Panel_n_Tcell_Split_UMAP.png",
+        plot = p_umap_split,
+        width = 14,
+        height = 6,
+        dpi = 300,
+        bg = "white"
+    )
+
+    cluster_counts <- as.data.frame(
+        table(
+            cluster = tcell_obj\$seurat_clusters,
+            sample = tcell_obj@meta.data[[split_var]]
+        )
+    )
+
+    cluster_props <- cluster_counts %>%
+        group_by(sample) %>%
+        mutate(freq = Freq / sum(Freq) * 100)
+
+    write.csv(
+        cluster_props,
+        "Panel_n_cluster_frequency.csv",
+        row.names = FALSE
+    )
+
+    p_freq <- ggplot(
+        cluster_props,
+        aes(x = sample, y = freq, fill = cluster)
+    ) +
+        geom_bar(stat = "identity", position = "fill") +
+        theme_classic(base_size = 14) +
+        labs(
+            title = "Cluster frequency by sample/tissue",
+            x = "",
+            y = "Fraction of cells",
+            fill = "Cluster"
+        )
+
+    ggsave(
+        "Panel_n_cluster_frequency.png",
+        plot = p_freq,
+        width = 8,
+        height = 6,
+        dpi = 300,
+        bg = "white"
+    )
+    """
+}
+
+
+/*
+=========================================
+  Workflow Definition
+=========================================
+*/
+
+workflow {
+    ch_h5 = Channel
+        .fromPath("${params.data_dir}/*.h5", checkIfExists: true)
+        .map { file -> tuple(file.simpleName, file) }
+
+    CREATE_AND_QC(ch_h5)
+
+    MERGE_SAMPLES(CREATE_AND_QC.out.rds.collect())
+
+    NORM_PCA(MERGE_SAMPLES.out.rds)
+
+    CLUSTERING_UMAP(NORM_PCA.out.rds)
+}
